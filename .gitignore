@@ -1,0 +1,5 @@
+node_modules/
+.env
+
+# Also ignore the local database during git push so it doesn't overwrite prod DB
+data.json
