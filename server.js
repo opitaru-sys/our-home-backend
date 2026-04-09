@@ -1,13 +1,63 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
+const mongoose = require('mongoose');
+require('dotenv').config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const DATA_FILE = path.join(__dirname, 'data.json');
+// --- Setup Mongoose ---
+// We read MONGO_URI from the environment variables set in Render
+const mongoUri = process.env.MONGO_URI;
+
+if (mongoUri) {
+  mongoose.connect(mongoUri, { useNewUrlParser: true, useUnifiedTopology: true })
+    .then(() => console.log("Connected to MongoDB Atlas"))
+    .catch((err) => console.error("MongoDB Connection Error:", err));
+} else {
+  console.warn("WARNING: MONGO_URI is not set. Database will not connect.");
+}
+
+const DayStateSchema = new mongoose.Schema({
+  daily: { type: Map, of: Boolean, default: {} },
+  anchorDone: { type: Map, of: Boolean, default: {} }
+}, { _id: false });
+
+const HouseholdSchema = new mongoose.Schema({
+  code: { type: String, required: true, unique: true },
+  language: { type: String, default: 'he' },
+  streak: { type: Number, default: 0 },
+  latestDate: { type: String },
+  weekStartDate: { type: String },
+  
+  dailyTasks: { type: [String], default: ['dishwasher', 'kitchen', 'hallway', 'bottles'] },
+  weeklyTasks: { 
+    type: Map, 
+    of: String, 
+    default: {
+      "0": "Laundry + fold",
+      "1": "Floors throughout",
+      "2": "Buffer day",
+      "3": "Living room reset",
+      "4": "Laundry + fold",
+      "5": "Brush Nixi",
+      "6": "Buffer day"
+    } 
+  },
+  anchorTasks: { type: [String], default: ['recycling', 'sterilize'] },
+  weeklyTasksDone: { type: Map, of: Boolean, default: {} },
+  
+  zoneTaskCarryover: {
+    taskName: String,
+    originalDate: String,
+    daysCarried: Number
+  },
+  
+  history: { type: Map, of: DayStateSchema, default: {} }
+});
+
+const Household = mongoose.model('Household', HouseholdSchema);
 
 // Helper: Get today's date string in Asia/Jerusalem
 const getTodayString = (dateObj = new Date()) => {
@@ -19,10 +69,13 @@ const getTodayString = (dateObj = new Date()) => {
   }).format(dateObj); // Returns YYYY-MM-DD
 };
 
-// Helper: Get Day of week (0-6)
-const getDayOfWeek = (dateObj = new Date()) => {
-  const dateStr = dateObj.toLocaleString("en-US", {timeZone: "Asia/Jerusalem"});
-  return new Date(dateStr).getDay();
+// Helper: Get Sunday of the current week (to reset weekly tasks)
+const getWeekStart = (dateStr) => {
+  const d = new Date(dateStr);
+  const day = d.getDay();
+  // subtract days to get Sunday
+  d.setDate(d.getDate() - day);
+  return getTodayString(d);
 };
 
 const diffInDays = (date1Str, date2Str) => {
@@ -31,177 +84,172 @@ const diffInDays = (date1Str, date2Str) => {
   return Math.round((d2 - d1) / (1000 * 60 * 60 * 24));
 };
 
-// State functions
-const readData = () => {
-  if (!fs.existsSync(DATA_FILE)) return { households: {} };
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8')); } 
-  catch(e) { return { households: {} }; }
-};
-const writeData = (data) => fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+const generateCode = () => Math.random().toString(36).substring(2, 6).toUpperCase();
 
-// Generate a specific 4-6 char code
-const generateCode = () => {
-  return Math.random().toString(36).substring(2, 6).toUpperCase();
-};
+// Initialize empty day
+const createEmptyDayState = (household) => {
+  const daily = {};
+  household.dailyTasks.forEach(task => daily[task] = false);
 
-const DEFAULT_SCHEDULE = {
-  // Sunday = 0, Monday = 1... Saturday = 6
-  0: "Laundry + fold",
-  1: "Floors throughout",
-  2: "Buffer day",
-  3: "Living room reset",
-  4: "Laundry + fold",
-  5: "Brush Nixi",
-  6: "Buffer day"
+  const anchorDone = {};
+  household.anchorTasks.forEach(task => anchorDone[task] = false);
+
+  return { daily, anchorDone };
 };
 
-const DAILY_TASKS = ['dishwasher', 'emma', 'hallway', 'bottles'];
-const ANCHOR_TASKS = ['recycling', 'sterilize'];
-
-// Initialize a day's state
-const createEmptyDayState = () => ({
-  daily: { dishwasher: false, emma: false, hallway: false, bottles: false },
-  zoneTaskDone: false,
-  anchorDone: { recycling: false, sterilize: false }
-});
-
-const calculateRollover = (householdObj) => {
+const calculateRollover = async (household) => {
   const todayStr = getTodayString();
-  if (!householdObj.history) householdObj.history = {};
-  if (!householdObj.history[todayStr]) {
-    // We are on a new day! Calculate streak from previous dates
-    let currentStreak = householdObj.streak || 0;
+  const weekStart = getWeekStart(todayStr);
+
+  // If a new week started, clear weekly tasks done
+  if (household.weekStartDate !== weekStart) {
+    household.weekStartDate = weekStart;
+    household.weeklyTasksDone = {};
+  }
+
+  if (!household.history.has(todayStr)) {
+    // New day! Calculate streak
+    let currentStreak = household.streak || 0;
     
-    // Find the latest day we have recorded before today
-    const pastDays = Object.keys(householdObj.history).filter(d => d < todayStr).sort();
-    if (pastDays.length > 0) {
+    // Convert history map to sorted array of previous days
+    const passDays = Array.from(household.history.keys()).filter(d => d < todayStr).sort();
+    
+    if (passDays.length > 0) {
       const yesterdayStr = getTodayString(new Date(Date.now() - 86400000));
-      const lastRecordedDayStr = pastDays[pastDays.length - 1];
+      const lastRecordedDayStr = passDays[passDays.length - 1];
       
       if (lastRecordedDayStr !== yesterdayStr) {
-        // Missed yesterday entirely -> streak 0
-        currentStreak = 0;
+        currentStreak = 0; // missed yesterday entirely
       } else {
-        const lastDayData = householdObj.history[lastRecordedDayStr];
-        const completedDailies = Object.values(lastDayData.daily).filter(Boolean).length;
-        if (completedDailies >= 3) {
-          // Already added to streak? Wait, streak should be recalculated from scratch or just maintained?
-          // Since we check daily, if yesterday was successful and streak hasn't broken, it's fine.
-          // Note: we can just recalculate the streak retroactively to be sure.
-          let realStreak = 0;
-          for (let i = pastDays.length - 1; i >= 0; i--) {
-            const dStr = pastDays[i];
-            // if difference is > 1 day from previous check, break
-            if (i < pastDays.length - 1 && diffInDays(pastDays[i], pastDays[i+1]) > 1) {
-              break;
+        const lastDayData = household.history.get(lastRecordedDayStr);
+        let completedDailies = 0;
+        if (lastDayData && lastDayData.daily) {
+             completedDailies = Array.from(lastDayData.daily.values()).filter(Boolean).length;
+        }
+        
+        const needed = Math.floor(household.dailyTasks.length * 0.75); // Needs 75% complete to keep streak
+        
+        if (completedDailies >= needed) {
+            let realStreak = 0;
+            for (let i = passDays.length - 1; i >= 0; i--) {
+                if (i < passDays.length - 1 && diffInDays(passDays[i], passDays[i+1]) > 1) {
+                  break;
+                }
+                const dayData = household.history.get(passDays[i]);
+                const cCount = Array.from((dayData?.daily || new Map()).values()).filter(Boolean).length;
+                if (cCount >= needed) realStreak++;
+                else break;
             }
-            const count = Object.values(householdObj.history[dStr].daily).filter(Boolean).length;
-            if (count >= 3) realStreak++;
-            else break; // broken streak
-          }
-          currentStreak = realStreak;
+            currentStreak = realStreak;
         } else {
-          currentStreak = 0; // yesterday failed
+            currentStreak = 0;
         }
       }
     }
     
-    householdObj.streak = currentStreak;
-    householdObj.history[todayStr] = createEmptyDayState();
-    
-    // Handle carryover zone task here if it hasn't expired.
-    if (householdObj.zoneTaskCarryover) {
-       // if daysCarried >= 3, drop it
-       householdObj.zoneTaskCarryover.daysCarried += diffInDays(householdObj.latestDate, todayStr);
-       if (householdObj.zoneTaskCarryover.daysCarried > 3) {
-           householdObj.zoneTaskCarryover = null; // expired
-       }
-    }
-    
-    householdObj.latestDate = todayStr;
+    household.streak = currentStreak;
+    household.history.set(todayStr, createEmptyDayState(household));
+    household.latestDate = todayStr;
   }
 };
 
 let sseClients = {};
-
 const broadcast = (code, householdData) => {
   if (sseClients[code]) {
     sseClients[code].forEach(res => res.write(`data: ${JSON.stringify(householdData)}\n\n`));
   }
 };
 
-app.post('/api/household', (req, res) => {
-  const data = readData();
-  let code = generateCode();
-  while (data.households[code]) code = generateCode();
+app.post('/api/household', async (req, res) => {
+  let code = '';
+  // Avoid infinite loops in case code generation hits collisions
+  for (let i = 0; i < 100; i++) {
+      code = generateCode();
+      const exists = await Household.exists({ code });
+      if (!exists) break;
+  }
   
   const todayStr = getTodayString();
-  const newHousehold = {
+  const weekStart = getWeekStart(todayStr);
+  
+  const newHousehold = new Household({
     code,
-    language: 'he',
-    weeklyZoneSchedule: DEFAULT_SCHEDULE,
-    streak: 0,
+    weekStartDate: weekStart,
     latestDate: todayStr,
-    history: { [todayStr]: createEmptyDayState() },
-    zoneTaskCarryover: null // { taskName, originalDate, daysCarried }
-  };
+    weeklyTasksDone: {}
+  });
   
-  data.households[code] = newHousehold;
-  writeData(data);
-  res.json(newHousehold);
+  newHousehold.history.set(todayStr, createEmptyDayState(newHousehold));
+
+  try {
+      await newHousehold.save();
+      res.json(newHousehold);
+  } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Failed to create household" });
+  }
 });
 
-app.get('/api/household/:code', (req, res) => {
-  const data = readData();
-  const code = req.params.code.toUpperCase();
-  const household = data.households[code];
-  if (!household) return res.status(404).json({ error: 'Not found' });
-  
-  // Ensure up to date for today
-  calculateRollover(household);
-  writeData(data);
-  
-  res.json(household);
+app.get('/api/household/:code', async (req, res) => {
+  try {
+    const code = req.params.code.toUpperCase();
+    const household = await Household.findOne({ code });
+    if (!household) return res.status(404).json({ error: 'Not found' });
+    
+    await calculateRollover(household);
+    await household.save();
+    res.json(household);
+  } catch(e) {
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
-app.post('/api/household/:code/update', (req, res) => {
-  const data = readData();
-  const code = req.params.code.toUpperCase();
-  const household = data.households[code];
-  if (!household) return res.status(404).json({ error: 'Not found' });
+app.post('/api/household/:code/update', async (req, res) => {
+  try {
+    const code = req.params.code.toUpperCase();
+    const household = await Household.findOne({ code });
+    if (!household) return res.status(404).json({ error: 'Not found' });
 
-  calculateRollover(household); // ensure today is fresh
-  
-  const todayStr = getTodayString();
-  
-  // req.body should have partial updates directly on the history object for today
-  // Example: { daily: { dishwasher: true }, zoneTaskDone: true, anchorDone: { recycling: false }}
-  
-  const updates = req.body;
-  if (updates.daily) {
-    household.history[todayStr].daily = { ...household.history[todayStr].daily, ...updates.daily };
+    await calculateRollover(household);
+    
+    const todayStr = getTodayString();
+    const updates = req.body;
+    
+    if (updates.daily) {
+      const todayState = household.history.get(todayStr);
+      for (const [k, v] of Object.entries(updates.daily)) {
+          todayState.daily.set(k, v);
+      }
+    }
+    if (updates.weeklyTasksDone) {
+        for (const [k, v] of Object.entries(updates.weeklyTasksDone)) {
+            household.weeklyTasksDone.set(k, v);
+        }
+    }
+    if (updates.anchorDone) {
+      const todayState = household.history.get(todayStr);
+      for (const [k, v] of Object.entries(updates.anchorDone)) {
+          todayState.anchorDone.set(k, v);
+      }
+    }
+    
+    // Custom task array updates
+    if (updates.dailyTasks) household.dailyTasks = updates.dailyTasks;
+    if (updates.weeklyTasks) {
+        for (const [k, v] of Object.entries(updates.weeklyTasks)) {
+            household.weeklyTasks.set(k, v);
+        }
+    }
+    if (updates.anchorTasks) household.anchorTasks = updates.anchorTasks;
+    if (updates.language) household.language = updates.language;
+    
+    await household.save();
+    broadcast(code, household);
+    res.json(household);
+  } catch(e) {
+    console.error(e);
+    res.status(500).json({ error: "Update failed" });
   }
-  if (updates.zoneTaskDone !== undefined) {
-    household.history[todayStr].zoneTaskDone = updates.zoneTaskDone;
-  }
-  if (updates.anchorDone) {
-    // If they checked an anchor task, we only apply it to today if today is Friday (5) or Saturday (6)
-    // Actually, checking it on Friday means it shouldn't be required on Saturday. 
-    household.history[todayStr].anchorDone = { ...household.history[todayStr].anchorDone, ...updates.anchorDone };
-    // also propagate backwards to yesterday if today is Saturday? 
-    // They can just view it as "weekly anchor is done". We will handle the check logic on frontend.
-  }
-  if (updates.zoneTaskCarryover !== undefined) {
-      household.zoneTaskCarryover = updates.zoneTaskCarryover;
-  }
-  
-  if (updates.language) {
-      household.language = updates.language;
-  }
-  
-  writeData(data);
-  broadcast(code, household);
-  res.json(household);
 });
 
 app.get('/api/household/:code/events', (req, res) => {
@@ -209,7 +257,7 @@ app.get('/api/household/:code/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders(); // flush the headers to establish SSE
+  res.flushHeaders();
 
   if (!sseClients[code]) sseClients[code] = [];
   sseClients[code].push(res);
